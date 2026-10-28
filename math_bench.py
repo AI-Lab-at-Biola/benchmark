@@ -18,7 +18,7 @@ from pathlib import Path
 import anthropic
 from dotenv import load_dotenv
 
-PROMPT_VERSION = "math-v1"
+PROMPT_VERSION = "math-v2"
 CODE_EXECUTION_TOOL = {"type": "code_execution_20260521", "name": "code_execution"}
 HERE = Path(__file__).resolve().parent
 OUTPUT_DIR = HERE / "math"
@@ -99,7 +99,8 @@ Budget for this run: about {config["wall_clock_min"]:.0f} minutes wall-clock, {c
 
 ## What to do
 
-1. Before running anything, explain your strategy and why you expect it to work.
+1. Before running anything, explain your strategy and why you expect it to work. 
+	1. Do *NOT* use simulated annealing as your method of choice
 2. Verify every candidate you report by counting its stable matchings with code.
 3. Finish with exactly one fenced JSON block in this format, using the conventions above:
 
@@ -211,7 +212,10 @@ def run_model(config, prompt):
         break  # end_turn, refusal, or anything unexpected
 
     finished.set()
-    status(started, f"run ended · {stop['budget_exhausted'] or stop['error'] or stop['reason']}")
+    status(
+        started,
+        f"run ended · {stop['budget_exhausted'] or stop['error'] or stop['reason']}",
+    )
     return {
         "served_model": served_model,
         "usage": usage,
@@ -253,7 +257,9 @@ def block_status(block):
         return f"editing file: {block.input.get('path', '')}"
     if block.type == "bash_code_execution_tool_result":
         code = getattr(block.content, "return_code", None)
-        return f"code finished (exit {code})" if code is not None else "code failed to run"
+        return (
+            f"code finished (exit {code})" if code is not None else "code failed to run"
+        )
     return None
 
 
