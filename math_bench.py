@@ -1,21 +1,15 @@
 """Math track: Maximizing stable matchings (docs/math/starter_doc.md).
 
-Run once a day:  uv run math.py
+Run once a day:  uv run math_bench.py
 Config comes from .env. Writes ./math/<date>_<model>.pdf and a matching .json.
 """
-
-import os
-import sys
-
-# This file is named math.py, which would shadow the stdlib `math` module for every
-# library imported below. Drop this folder from the import path before importing anything else.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != _HERE]
 
 import hashlib
 import itertools
 import json
+import os
 import re
+import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -29,7 +23,8 @@ from reportlab.pdfbase import pdfmetrics, ttfonts
 
 PROMPT_VERSION = "math-v1"
 CODE_EXECUTION_TOOL = {"type": "code_execution_20260521", "name": "code_execution"}
-OUTPUT_DIR = Path(_HERE) / "math"
+HERE = Path(__file__).resolve().parent
+OUTPUT_DIR = HERE / "math"
 
 # Section 10: phrases that suggest the model recalled the paper.
 CONTAMINATION_PATTERNS = [r"cross-diagonal", r"truncated Latin square", r"\bMarks\b", r"\bBuzi\b", r"\bEilers\b", r"problem reduction"]
@@ -41,7 +36,7 @@ ORDER_7_TIERS = [(82, 5), (81, 4), (71, 3), (39, 2), (11, 1), (0, 0)]
 # --- Config -------------------------------------------------------------------------------------
 
 def load_config():
-    load_dotenv(Path(_HERE) / ".env")
+    load_dotenv(HERE / ".env")
     required = [
         "ANTHROPIC_API_KEY", "MATH_MODEL", "MATH_EFFORT", "MATH_ORDER", "MATH_TARGET",
         "MATH_PREVIOUS_BEST", "MATH_WALL_CLOCK_MIN", "MATH_MAX_OUTPUT_TOKENS", "MATH_MAX_TOOL_CALLS",
