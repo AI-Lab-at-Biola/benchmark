@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+#pycharm
+.idea
