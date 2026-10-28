@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -130,6 +131,12 @@ def run_model(config, prompt):
     stop = {"reason": None, "budget_exhausted": None, "error": None}
     served_model = None
     started = time.monotonic()
+    activity = {"last": started}  # when the stream last delivered anything
+    finished = threading.Event()
+    threading.Thread(
+        target=heartbeat, args=(started, activity, finished), daemon=True
+    ).start()
+    status(started, f"run started · {config['model']} · effort {config['effort']}")
 
     while True:
         elapsed_min = (time.monotonic() - started) / 60
@@ -157,6 +164,12 @@ def run_model(config, prompt):
 
         try:
             with client.messages.stream(**request) as stream:
+                for event in stream:
+                    activity["last"] = time.monotonic()
+                    if event.type == "content_block_stop":
+                        note = block_status(event.content_block)
+                        if note:
+                            status(started, note)
                 response = stream.get_final_message()
         except anthropic.APIError as error:
             stop["error"] = f"{type(error).__name__}: {error}"
@@ -177,6 +190,11 @@ def run_model(config, prompt):
         )
         messages.append({"role": "assistant", "content": response.content})
         stop["reason"] = response.stop_reason
+        status(
+            started,
+            f"response {len(responses)} · {response.stop_reason} · "
+            f"{tool_calls} code runs · {usage['output']:,} output tokens",
+        )
 
         if response.stop_reason == "pause_turn":
             # The server's tool loop hit its iteration limit; resending the history resumes it.
@@ -192,6 +210,8 @@ def run_model(config, prompt):
             continue
         break  # end_turn, refusal, or anything unexpected
 
+    finished.set()
+    status(started, f"run ended · {stop['budget_exhausted'] or stop['error'] or stop['reason']}")
     return {
         "served_model": served_model,
         "usage": usage,
@@ -200,6 +220,41 @@ def run_model(config, prompt):
         "stop": stop,
         "responses": responses,
     }
+
+
+def status(started, message):
+    elapsed = time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - started))
+    print(f"[{elapsed}] {message}", flush=True)
+
+
+def heartbeat(started, activity, finished, every_s=120):
+    """Every couple of quiet minutes, say how long it's been since the stream sent anything.
+
+    Long code runs in the sandbox are silent, so a quiet stretch alone isn't a stall;
+    a number that keeps climbing past ~15 min is.
+    """
+    while not finished.wait(every_s):
+        quiet_min = (time.monotonic() - activity["last"]) / 60
+        if quiet_min >= every_s / 60:
+            status(started, f"still waiting · {quiet_min:.0f} min since last update")
+
+
+def block_status(block):
+    """A short progress note for a finished response block, or None."""
+    if block.type == "thinking":
+        return "thinking done"
+    if block.type == "text":
+        first_line = block.text.strip().splitlines()[0] if block.text.strip() else ""
+        return f"model: {first_line[:100]}"
+    if block.type == "server_tool_use":
+        if block.name == "bash_code_execution":
+            command = str(block.input.get("command", "")).strip().splitlines()
+            return f"running: {command[0][:100] if command else ''}"
+        return f"editing file: {block.input.get('path', '')}"
+    if block.type == "bash_code_execution_tool_result":
+        code = getattr(block.content, "return_code", None)
+        return f"code finished (exit {code})" if code is not None else "code failed to run"
+    return None
 
 
 def add_usage(totals, usage):
