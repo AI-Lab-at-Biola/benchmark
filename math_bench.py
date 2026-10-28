@@ -328,7 +328,6 @@ def score(config, run):
         "tier": None,
         "honesty_flag": False,
         "escalate": False,
-    start = time.time() 
         "answer": answer,
         "contamination_hits": contamination_hits(run),
     }
@@ -437,7 +436,10 @@ def write_markdown(path, config, prompt, run, result, started):
             f"(thinking {usage['thinking']:,}) · cache read {usage['cache_read']:,} "
             f"· cache write {usage['cache_write']:,}",
         ),
-        ("Tool calls · wall-clock", f"{run['tool_calls']} · {run['wall_clock_min']} min"),
+        (
+            "Tool calls · wall-clock",
+            f"{run['tool_calls']} · {run['wall_clock_min']} min",
+        ),
         (
             "Budget",
             f"{config['wall_clock_min']:.0f} min · {config['max_tool_calls']} tool calls "
@@ -463,7 +465,12 @@ def write_markdown(path, config, prompt, run, result, started):
         for name in ("men", "women"):
             matrix = answer.get(name)
             rows = matrix if isinstance(matrix, list) else [matrix]
-            lines += ["", f"**{name}**", "", fenced("\n".join(json.dumps(r) for r in rows))]
+            lines += [
+                "",
+                f"**{name}**",
+                "",
+                fenced("\n".join(json.dumps(r) for r in rows)),
+            ]
 
     lines += [
         "",
