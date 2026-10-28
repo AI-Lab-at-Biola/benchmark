@@ -1,7 +1,7 @@
 """Math track: Maximizing stable matchings (docs/math/starter_doc.md).
 
 Run once a day:  uv run math_bench.py
-Config comes from .env. Writes ./math/<date>_<model>.pdf and a matching .json.
+Config comes from .env. Writes ./math/<datetime>_<model>/run.json and run.md.
 """
 
 import hashlib
@@ -11,15 +11,11 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
-from xml.sax.saxutils import escape
 
 import anthropic
 from dotenv import load_dotenv
-from reportlab import platypus
-from reportlab.lib import colors, pagesizes, styles, units
-from reportlab.pdfbase import pdfmetrics, ttfonts
 
 PROMPT_VERSION = "math-v1"
 CODE_EXECUTION_TOOL = {"type": "code_execution_20260521", "name": "code_execution"}
@@ -360,283 +356,149 @@ def score(config, run):
 # --- Report ----------------------------------------------------------------------------------
 
 
-def register_fonts():
-    """Arial and Menlo cover symbols like Φ and ≤ that the built-in PDF fonts can't draw."""
-    fonts = {
-        "body": "Helvetica",
-        "bold": "Helvetica-Bold",
-        "italic": "Helvetica-Oblique",
-        "mono": "Courier",
-    }
-    supplemental = Path("/System/Library/Fonts/Supplemental")
-    try:
-        pdfmetrics.registerFont(ttfonts.TTFont("Arial", supplemental / "Arial.ttf"))
-        pdfmetrics.registerFont(
-            ttfonts.TTFont("Arial-Bold", supplemental / "Arial Bold.ttf")
-        )
-        pdfmetrics.registerFont(
-            ttfonts.TTFont("Arial-Italic", supplemental / "Arial Italic.ttf")
-        )
-        fonts.update(body="Arial", bold="Arial-Bold", italic="Arial-Italic")
-    except Exception:
-        pass
-    try:
-        pdfmetrics.registerFont(
-            ttfonts.TTFont("Menlo", "/System/Library/Fonts/Menlo.ttc", subfontIndex=0)
-        )
-        fonts["mono"] = "Menlo"
-    except Exception:
-        pass
-    return fonts
+def fenced(text, lang=""):
+    """A Markdown code block whose fence can't collide with backticks inside the text."""
+    longest = max((len(ticks) for ticks in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}{lang}\n{text.rstrip()}\n{fence}"
 
 
-def write_pdf(path, config, prompt, run, result):
-    fonts = register_fonts()
-    base = styles.getSampleStyleSheet()
-    body = styles.ParagraphStyle(
-        "body",
-        parent=base["BodyText"],
-        fontName=fonts["body"],
-        fontSize=9.5,
-        leading=13,
+def truncated(text, max_lines=300):
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    hidden = len(lines) - max_lines
+    return "\n".join(lines[:max_lines] + [f"... ({hidden} more lines in run.json)"])
+
+
+def flag_summary(config, run, result):
+    stop = run["stop"]
+    hits = ", ".join(result["contamination_hits"])
+    checks = [
+        ("claimed ≠ verified", result["honesty_flag"]),
+        (f"Φ > {config['target']}: ESCALATE to Dr. Marks", result["escalate"]),
+        (f"contamination terms: {hits}", result["contamination_hits"]),
+        (f"budget exhausted ({stop['budget_exhausted']})", stop["budget_exhausted"]),
+        (f"API error: {stop['error']}", stop["error"]),
+    ]
+    return ", ".join(label for label, on in checks if on) or "none"
+
+
+def block_markdown(block):
+    """Markdown lines for one transcript block; empty for blocks with nothing to show."""
+    kind = block["type"]
+    if kind == "thinking":
+        if not block["text"]:
+            return []
+        quoted = "\n".join(f"> {line}" for line in block["text"].splitlines())
+        return ["**Thinking**", "", quoted]
+    if kind == "text":
+        return ["**Model**", "", block["text"]]
+    if kind == "tool_call":
+        inp = block["input"]
+        if block["tool"] == "bash_code_execution":
+            return ["**Code** (bash)", "", fenced(str(inp.get("command")), "bash")]
+        if "file_text" in inp:
+            path = str(inp.get("path", ""))
+            lang = "python" if path.endswith(".py") else ""
+            label = f"**Code** ({inp.get('command')} `{path}`)"
+            return [label, "", fenced(inp["file_text"], lang)]
+        return ["**Code**", "", fenced(json.dumps(inp, indent=2), "json")]
+    if kind == "tool_output":
+        if "stdout" in block:
+            text = block["stdout"]
+            if block["stderr"]:
+                text += f"\n[stderr]\n{block['stderr']}"
+            label = f"**Output** (exit {block['return_code']})"
+            return [label, "", fenced(truncated(text))]
+        detail = block.get("editor") or block.get("error")
+        return ["**Output**", "", fenced(json.dumps(detail, indent=2), "json")]
+    return [f"**{kind}**", "", fenced(json.dumps(block, indent=2, default=str), "json")]
+
+
+def write_markdown(path, config, prompt, run, result, started):
+    usage = run["usage"]
+    verified = (
+        result["verified_phi"]
+        if result["valid"]
+        else f"INVALID: {result['invalid_reason']}"
     )
-    para_styles = {
-        "title": styles.ParagraphStyle(
-            "title", parent=base["Title"], fontName=fonts["bold"], fontSize=16
+    summary = [
+        ("Verified Φ", verified),
+        ("Claimed Φ", result["claimed_phi"]),
+        ("Tier (n=7 ladder)", result["tier"]),
+        ("Flags", flag_summary(config, run, result)),
+        ("Stop reason", run["stop"]["reason"]),
+        ("Model (requested / served)", f"{config['model']} / {run['served_model']}"),
+        ("Effort · prompt version", f"{config['effort']} · {PROMPT_VERSION}"),
+        (
+            "Tokens",
+            f"input {usage['input']:,} · output {usage['output']:,} "
+            f"(thinking {usage['thinking']:,}) · cache read {usage['cache_read']:,} "
+            f"· cache write {usage['cache_write']:,}",
         ),
-        "h2": styles.ParagraphStyle(
-            "h2",
-            parent=base["Heading2"],
-            fontName=fonts["bold"],
-            fontSize=12,
-            spaceBefore=10,
-        ),
-        "label": styles.ParagraphStyle(
-            "label", parent=body, fontName=fonts["bold"], spaceBefore=6
-        ),
-        "body": body,
-        "thinking": styles.ParagraphStyle(
-            "thinking",
-            parent=body,
-            fontName=fonts["italic"],
-            textColor=colors.HexColor("#555555"),
-            leftIndent=8,
-        ),
-        "mono": styles.ParagraphStyle(
-            "mono",
-            parent=body,
-            fontName=fonts["mono"],
-            fontSize=7.5,
-            leading=9.5,
-            backColor=colors.HexColor("#f4f4f4"),
-            borderPadding=4,
-            leftIndent=4,
-            rightIndent=4,
-        ),
-    }
-
-    def para(text, style="body"):
-        return platypus.Paragraph(
-            escape(text).replace("\n", "<br/>"), para_styles[style]
-        )
-
-    def code(text, max_lines=300):
-        lines = text.splitlines() or [""]
-        if len(lines) > max_lines:
-            lines = lines[:max_lines] + [
-                f"... ({len(lines) - max_lines} more lines in the .json)"
-            ]
-        return platypus.Preformatted(
-            "\n".join(lines), para_styles["mono"], maxLineLength=110, newLineChars=""
-        )
-
-    def table(rows, widths=None):
-        t = platypus.Table(
-            [[para(str(c)) for c in row] for row in rows],
-            colWidths=widths,
-            hAlign="LEFT",
-        )
-        t.setStyle(
-            platypus.TableStyle(
-                [
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ]
-            )
-        )
-        return t
-
-    usage, stop = run["usage"], run["stop"]
-    story = [
-        para(f"Math track: {config['model']} · {date.today().isoformat()}", "title"),
-        para("Summary", "h2"),
-        table(
-            [
-                [
-                    "Verified Φ",
-                    result["verified_phi"]
-                    if result["valid"]
-                    else f"INVALID: {result['invalid_reason']}",
-                ],
-                ["Claimed Φ", result["claimed_phi"]],
-                ["Tier (n=7 ladder)", result["tier"]],
-                [
-                    "Flags",
-                    ", ".join(
-                        f
-                        for f, on in [
-                            ("claimed ≠ verified", result["honesty_flag"]),
-                            (
-                                f"Φ > {config['target']}: ESCALATE to Dr. Marks",
-                                result["escalate"],
-                            ),
-                            (
-                                f"contamination terms: {', '.join(result['contamination_hits'])}",
-                                result["contamination_hits"],
-                            ),
-                            (
-                                f"budget exhausted ({stop['budget_exhausted']})",
-                                stop["budget_exhausted"],
-                            ),
-                            (f"API error: {stop['error']}", stop["error"]),
-                        ]
-                        if on
-                    )
-                    or "none",
-                ],
-                ["Stop reason", stop["reason"]],
-                [
-                    "Model (requested / served)",
-                    f"{config['model']} / {run['served_model']}",
-                ],
-                ["Effort · prompt version", f"{config['effort']} · {PROMPT_VERSION}"],
-                [
-                    "Tokens",
-                    f"input {usage['input']:,} · output {usage['output']:,} (thinking {usage['thinking']:,}) · "
-                    f"cache read {usage['cache_read']:,} · cache write {usage['cache_write']:,}",
-                ],
-                [
-                    "Tool calls · wall-clock",
-                    f"{run['tool_calls']} · {run['wall_clock_min']} min",
-                ],
-                [
-                    "Budget",
-                    f"{config['wall_clock_min']:.0f} min · {config['max_tool_calls']} tool calls · {config['max_output_tokens']:,} output tokens",
-                ],
-            ],
-            widths=[1.8 * units.inch, 5.2 * units.inch],
+        ("Tool calls · wall-clock", f"{run['tool_calls']} · {run['wall_clock_min']} min"),
+        (
+            "Budget",
+            f"{config['wall_clock_min']:.0f} min · {config['max_tool_calls']} tool calls "
+            f"· {config['max_output_tokens']:,} output tokens",
         ),
     ]
+    lines = [
+        f"# Math track: {config['model']} · {started:%Y-%m-%d %H:%M}",
+        "",
+        "## Summary",
+        "",
+        "| | |",
+        "| --- | --- |",
+    ]
+    for label, value in summary:
+        cell = str(value).replace("|", "\\|")
+        lines.append(f"| {label} | {cell} |")
 
     answer = result["answer"]
     if answer:
-        story.append(para("Submitted profile", "h2"))
-        story.append(para(answer.get("strategy_summary", "(no strategy_summary)")))
+        strategy = answer.get("strategy_summary", "(no strategy_summary)")
+        lines += ["", "## Submitted profile", "", str(strategy)]
         for name in ("men", "women"):
             matrix = answer.get(name)
-            if isinstance(matrix, list):
-                story.append(para(f"{name}", "label"))
-                story.append(
-                    code(
-                        "\n".join(
-                            " ".join(
-                                f"{v:>2}" if isinstance(v, int) else str(v) for v in row
-                            )
-                            if isinstance(row, list)
-                            else str(row)
-                            for row in matrix
-                        )
-                    )
-                )
+            rows = matrix if isinstance(matrix, list) else [matrix]
+            lines += ["", f"**{name}**", "", fenced("\n".join(json.dumps(r) for r in rows))]
 
-    story += [
-        platypus.PageBreak(),
-        para("Transcript", "h2"),
-        para(
-            "Thinking is Anthropic's summarized reasoning, not the full chain of thought.",
-            "thinking",
-        ),
+    lines += [
+        "",
+        "## Transcript",
+        "",
+        "_Thinking is Anthropic's summarized reasoning, not the full chain of thought._",
     ]
     for number, response in enumerate(run["responses"], start=1):
-        story.append(
-            para(f"Response {number} (stop: {response['stop_reason']})", "label")
-        )
+        lines += ["", f"### Response {number} (stop: {response['stop_reason']})"]
         for block in response["blocks"]:
-            kind = block["type"]
-            if kind == "thinking" and block["text"]:
-                story += [para("Thinking", "label"), para(block["text"], "thinking")]
-            elif kind == "text":
-                story += [para("Model", "label"), para(block["text"])]
-            elif kind == "tool_call":
-                inp = block["input"]
-                text = (
-                    inp.get("command")
-                    if block["tool"] == "bash_code_execution"
-                    else json.dumps(inp, indent=2)
-                )
-                if block["tool"] == "text_editor_code_execution" and "file_text" in inp:
-                    text = (
-                        f"# {inp.get('command')} {inp.get('path')}\n{inp['file_text']}"
-                    )
-                story += [para(f"Code ({block['tool']})", "label"), code(str(text))]
-            elif kind == "tool_output":
-                if "stdout" in block:
-                    text = block["stdout"] + (
-                        f"\n[stderr]\n{block['stderr']}" if block["stderr"] else ""
-                    )
-                    story += [
-                        para(f"Output (exit {block['return_code']})", "label"),
-                        code(text),
-                    ]
-                else:
-                    story += [
-                        para("Output", "label"),
-                        code(
-                            json.dumps(
-                                block.get("editor") or block.get("error"), indent=2
-                            )
-                        ),
-                    ]
-        story.append(platypus.Spacer(1, 6))
+            block_lines = block_markdown(block)
+            if block_lines:
+                lines += ["", *block_lines]
 
-    story += [
-        platypus.PageBreak(),
-        para("Appendix: prompt", "h2"),
-        code(prompt, max_lines=1000),
-    ]
-    platypus.SimpleDocTemplate(
-        str(path),
-        pagesize=pagesizes.letter,
-        title=f"Math track {config['model']}",
-        leftMargin=0.7 * units.inch,
-        rightMargin=0.7 * units.inch,
-        topMargin=0.7 * units.inch,
-        bottomMargin=0.7 * units.inch,
-    ).build(story)
+    lines += ["", "## Appendix: prompt", "", fenced(prompt, "markdown")]
+    path.write_text("\n".join(lines) + "\n")
 
 
-def output_stem(model):
-    """./math/<date>_<model>, with a numeric suffix if today's run already exists."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    stem = OUTPUT_DIR / f"{date.today().isoformat()}_{model}"
-    suffix = 2
-    candidate = stem
-    while candidate.with_suffix(".pdf").exists():
-        candidate = stem.with_name(f"{stem.name}_{suffix}")
-        suffix += 1
-    return candidate
+def run_dir(started, model):
+    """./math/<datetime>_<model>/, one folder per run."""
+    path = OUTPUT_DIR / f"{started:%Y-%m-%d_%H%M%S}_{model}"
+    path.mkdir(parents=True)
+    return path
 
 
 def main():
     config = load_config()
     prompt = build_prompt(config)
-    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    started = datetime.now().astimezone()
     run = run_model(config, prompt)
     result = score(config, run)
 
-    stem = output_stem(config["model"])
+    out = run_dir(started, config["model"])
     record = {
-        "started_at": started_at,
+        "started_at": started.isoformat(timespec="seconds"),
         "prompt_version": PROMPT_VERSION,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "code_execution_tool": CODE_EXECUTION_TOOL["type"],
@@ -644,17 +506,15 @@ def main():
         "result": result,
         "run": run,
     }
-    stem.with_suffix(".json").write_text(json.dumps(record, indent=2, default=str))
-    write_pdf(stem.with_suffix(".pdf"), config, prompt, run, result)
+    (out / "run.json").write_text(json.dumps(record, indent=2, default=str))
+    write_markdown(out / "run.md", config, prompt, run, result, started)
 
     phi = (
         result["verified_phi"]
         if result["valid"]
         else f"invalid ({result['invalid_reason']})"
     )
-    print(
-        f"verified Φ: {phi} · claimed: {result['claimed_phi']} · {stem.with_suffix('.pdf')}"
-    )
+    print(f"verified Φ: {phi} · claimed: {result['claimed_phi']} · {out}")
     if result["escalate"]:
         print(f"*** Verified Φ above {config['target']}. Escalate to Dr. Marks. ***")
 
