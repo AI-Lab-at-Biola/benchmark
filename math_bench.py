@@ -1,7 +1,8 @@
 """Math track: Maximizing stable matchings (docs/math/starter_doc.md).
 
 Run once a day:  uv run math_bench.py
-Config comes from .env. Writes ./math/<datetime>_<model>/run.json and run.md.
+Config comes from .env; MATH_PROVIDER picks Anthropic or OpenAI.
+Writes ./math/<datetime>_<model>/run.json and run.md.
 """
 
 import hashlib
@@ -10,16 +11,20 @@ import json
 import os
 import re
 import sys
-import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
 from dotenv import load_dotenv
 
+from model_calls import (
+    API_KEY_VARS,
+    CODE_EXECUTION_TOOL,
+    OPENAI_CODE_TOOL,
+    run_model,
+    run_openai,
+)
+
 PROMPT_VERSION = "math-v2"
-CODE_EXECUTION_TOOL = {"type": "code_execution_20260521", "name": "code_execution"}
 HERE = Path(__file__).resolve().parent
 OUTPUT_DIR = HERE / "math"
 
@@ -42,8 +47,11 @@ ORDER_7_TIERS = [(82, 5), (81, 4), (71, 3), (39, 2), (11, 1), (0, 0)]
 
 def load_config():
     load_dotenv(HERE / ".env")
+    provider = os.environ.get("MATH_PROVIDER", "").strip()
+    if provider not in API_KEY_VARS:
+        sys.exit(f"MATH_PROVIDER in .env must be one of: {', '.join(API_KEY_VARS)}")
     required = [
-        "ANTHROPIC_API_KEY",
+        API_KEY_VARS[provider],
         "MATH_MODEL",
         "MATH_EFFORT",
         "MATH_ORDER",
@@ -57,6 +65,7 @@ def load_config():
     if missing:
         sys.exit(f"Missing from .env: {', '.join(missing)}")
     return {
+        "provider": provider,
         "model": os.environ["MATH_MODEL"].strip(),
         "effort": os.environ["MATH_EFFORT"].strip(),
         "order": int(os.environ["MATH_ORDER"]),
@@ -116,186 +125,6 @@ Budget for this run: about {config["wall_clock_min"]:.0f} minutes wall-clock, {c
 
 4. State your confidence in the count. Do not claim your answer is optimal unless you have a proof.
 """
-
-
-# --- Run the model ----------------------------------------------------------------------------
-
-
-def run_model(config, prompt):
-    """Drive the conversation until the model finishes or a budget runs out. Returns the run record."""
-    client = anthropic.Anthropic()
-    messages = [{"role": "user", "content": prompt}]
-    usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "thinking": 0}
-    responses = []  # one entry per API request, in order
-    tool_calls = 0
-    container_id = None
-    stop = {"reason": None, "budget_exhausted": None, "error": None}
-    served_model = None
-    started = time.monotonic()
-    activity = {"last": started}  # when the stream last delivered anything
-    finished = threading.Event()
-    threading.Thread(
-        target=heartbeat, args=(started, activity, finished), daemon=True
-    ).start()
-    status(started, f"run started · {config['model']} · effort {config['effort']}")
-
-    while True:
-        elapsed_min = (time.monotonic() - started) / 60
-        remaining_tokens = config["max_output_tokens"] - usage["output"]
-        if elapsed_min >= config["wall_clock_min"]:
-            stop["budget_exhausted"] = "wall_clock"
-            break
-        if tool_calls >= config["max_tool_calls"]:
-            stop["budget_exhausted"] = "tool_calls"
-            break
-        if remaining_tokens < 1024:
-            stop["budget_exhausted"] = "output_tokens"
-            break
-
-        request = dict(
-            model=config["model"],
-            max_tokens=min(64000, remaining_tokens),
-            thinking={"type": "adaptive", "display": "summarized"},
-            output_config={"effort": config["effort"]},
-            tools=[CODE_EXECUTION_TOOL],
-            messages=messages,
-        )
-        if container_id:
-            request["container"] = container_id
-
-        try:
-            with client.messages.stream(**request) as stream:
-                for event in stream:
-                    activity["last"] = time.monotonic()
-                    if event.type == "content_block_stop":
-                        note = block_status(event.content_block)
-                        if note:
-                            status(started, note)
-                response = stream.get_final_message()
-        except anthropic.APIError as error:
-            stop["error"] = f"{type(error).__name__}: {error}"
-            break
-
-        served_model = response.model
-        if response.container:
-            container_id = response.container.id
-        add_usage(usage, response.usage)
-        tool_calls += sum(
-            1 for block in response.content if block.type == "server_tool_use"
-        )
-        responses.append(
-            {
-                "stop_reason": response.stop_reason,
-                "blocks": [block_record(b) for b in response.content],
-            }
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        stop["reason"] = response.stop_reason
-        status(
-            started,
-            f"response {len(responses)} · {response.stop_reason} · "
-            f"{tool_calls} code runs · {usage['output']:,} output tokens",
-        )
-
-        if response.stop_reason == "pause_turn":
-            # The server's tool loop hit its iteration limit; resending the history resumes it.
-            continue
-        if response.stop_reason == "max_tokens":
-            # Prefill isn't allowed, so a cut-off turn continues through a user message.
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "You hit the per-response output limit. Continue where you left off.",
-                }
-            )
-            continue
-        break  # end_turn, refusal, or anything unexpected
-
-    finished.set()
-    status(
-        started,
-        f"run ended · {stop['budget_exhausted'] or stop['error'] or stop['reason']}",
-    )
-    return {
-        "served_model": served_model,
-        "usage": usage,
-        "tool_calls": tool_calls,
-        "wall_clock_min": round((time.monotonic() - started) / 60, 2),
-        "stop": stop,
-        "responses": responses,
-    }
-
-
-def status(started, message):
-    elapsed = time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - started))
-    print(f"[{elapsed}] {message}", flush=True)
-
-
-def heartbeat(started, activity, finished, every_s=120):
-    """Every couple of quiet minutes, say how long it's been since the stream sent anything.
-
-    Long code runs in the sandbox are silent, so a quiet stretch alone isn't a stall;
-    a number that keeps climbing past ~15 min is.
-    """
-    while not finished.wait(every_s):
-        quiet_min = (time.monotonic() - activity["last"]) / 60
-        if quiet_min >= every_s / 60:
-            status(started, f"still waiting · {quiet_min:.0f} min since last update")
-
-
-def block_status(block):
-    """A short progress note for a finished response block, or None."""
-    if block.type == "thinking":
-        return "thinking done"
-    if block.type == "text":
-        first_line = block.text.strip().splitlines()[0] if block.text.strip() else ""
-        return f"model: {first_line[:100]}"
-    if block.type == "server_tool_use":
-        if block.name == "bash_code_execution":
-            command = str(block.input.get("command", "")).strip().splitlines()
-            return f"running: {command[0][:100] if command else ''}"
-        return f"editing file: {block.input.get('path', '')}"
-    if block.type == "bash_code_execution_tool_result":
-        code = getattr(block.content, "return_code", None)
-        return (
-            f"code finished (exit {code})" if code is not None else "code failed to run"
-        )
-    return None
-
-
-def add_usage(totals, usage):
-    totals["input"] += usage.input_tokens or 0
-    totals["output"] += usage.output_tokens or 0
-    totals["cache_read"] += usage.cache_read_input_tokens or 0
-    totals["cache_write"] += usage.cache_creation_input_tokens or 0
-    details = getattr(usage, "output_tokens_details", None)
-    totals["thinking"] += getattr(details, "thinking_tokens", 0) or 0
-
-
-def block_record(block):
-    """Reduce an API content block to the plain dict we log and render."""
-    if block.type == "thinking":
-        return {"type": "thinking", "text": block.thinking}
-    if block.type == "text":
-        return {"type": "text", "text": block.text}
-    if block.type == "server_tool_use":
-        return {"type": "tool_call", "tool": block.name, "input": block.input}
-    if block.type == "bash_code_execution_tool_result":
-        result = block.content
-        if result.type == "bash_code_execution_result":
-            return {
-                "type": "tool_output",
-                "return_code": result.return_code,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
-        return {
-            "type": "tool_output",
-            "error": getattr(result, "error_code", str(result)),
-        }
-    if block.type == "text_editor_code_execution_tool_result":
-        return {"type": "tool_output", "editor": block.content.to_dict()}
-    return {"type": block.type, "raw": block.to_dict()}
 
 
 # --- Verification (Section 7) -----------------------------------------------------------------
@@ -458,6 +287,8 @@ def block_markdown(block):
         inp = block["input"]
         if block["tool"] == "bash_code_execution":
             return ["**Code** (bash)", "", fenced(str(inp.get("command")), "bash")]
+        if block["tool"] == "code_interpreter":
+            return ["**Code** (python)", "", fenced(str(inp.get("code")), "python")]
         if "file_text" in inp:
             path = str(inp.get("path", ""))
             lang = "python" if path.endswith(".py") else ""
@@ -469,7 +300,10 @@ def block_markdown(block):
             text = block["stdout"]
             if block["stderr"]:
                 text += f"\n[stderr]\n{block['stderr']}"
-            label = f"**Output** (exit {block['return_code']})"
+            if block["return_code"] is None:
+                label = f"**Output** ({block.get('status')})"
+            else:
+                label = f"**Output** (exit {block['return_code']})"
             return [label, "", fenced(truncated(text))]
         detail = block.get("editor") or block.get("error")
         return ["**Output**", "", fenced(json.dumps(detail, indent=2), "json")]
@@ -489,7 +323,10 @@ def write_markdown(path, config, prompt, run, result, started):
         ("Tier (n=7 ladder)", result["tier"]),
         ("Flags", flag_summary(config, run, result)),
         ("Stop reason", run["stop"]["reason"]),
-        ("Model (requested / served)", f"{config['model']} / {run['served_model']}"),
+        (
+            "Model (requested / served)",
+            f"{config['provider']}: {config['model']} / {run['served_model']}",
+        ),
         ("Effort · prompt version", f"{config['effort']} · {PROMPT_VERSION}"),
         (
             "Tokens",
@@ -537,7 +374,7 @@ def write_markdown(path, config, prompt, run, result, started):
         "",
         "## Transcript",
         "",
-        "_Thinking is Anthropic's summarized reasoning, not the full chain of thought._",
+        "_Thinking is the provider's summarized reasoning, not the full chain of thought._",
     ]
     for number, response in enumerate(run["responses"], start=1):
         lines += ["", f"### Response {number} (stop: {response['stop_reason']})"]
@@ -561,7 +398,8 @@ def main():
     config = load_config()
     prompt = build_prompt(config)
     started = datetime.now().astimezone()
-    run = run_model(config, prompt)
+    is_openai = config["provider"] == "openai"
+    run = run_openai(config, prompt) if is_openai else run_model(config, prompt)
     result = score(config, run)
 
     out = run_dir(started, config["model"])
@@ -569,7 +407,7 @@ def main():
         "started_at": started.isoformat(timespec="seconds"),
         "prompt_version": PROMPT_VERSION,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-        "code_execution_tool": CODE_EXECUTION_TOOL["type"],
+        "code_execution_tool": OPENAI_CODE_TOOL if is_openai else CODE_EXECUTION_TOOL,
         "config": config,
         "result": result,
         "run": run,
