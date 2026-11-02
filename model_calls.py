@@ -18,6 +18,13 @@ OPENAI_CODE_TOOL = {
 }
 API_KEY_VARS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 MAX_TOKENS_PER_RESPONSE = 64000  # same per-response cap for both providers
+STREAM_RESUMES = 5  # reconnects to a dropped OpenAI stream before the run gives up
+# SDK-typed terminal events; incomplete and failed carry their output too.
+OPENAI_TERMINAL_EVENTS = {
+    "response.completed",
+    "response.incomplete",
+    "response.failed",
+}
 
 
 # --- Shared ----------------------------------------------------------------------------------
@@ -259,24 +266,32 @@ def run_openai(config, prompt):
         # Items are recorded as they finish, so a run cut off mid-response keeps its transcript.
         blocks = []
         response = None
+        response_id = None
+        events = openai_events(client, request, started)
         try:
-            with client.responses.stream(**request) as stream:
-                for event in stream:
-                    activity["last"] = time.monotonic()
-                    if event.type == "response.output_item.done":
-                        blocks += openai_item_records(event.item)
-                        if event.item.type == "code_interpreter_call":
-                            tool_calls += 1
-                        note = openai_item_status(event.item)
-                        if note:
-                            status(started, note)
-                    if (time.monotonic() - started) / 60 >= config["wall_clock_min"]:
-                        stop["budget_exhausted"] = "wall_clock"
-                        break
-                else:
-                    response = stream.get_final_response()
-        except openai.APIError as error:
+            for event in events:
+                activity["last"] = time.monotonic()
+                if event.type == "response.created":
+                    response_id = event.response.id
+                if event.type == "response.output_item.done":
+                    blocks += openai_item_records(event.item)
+                    if event.item.type == "code_interpreter_call":
+                        tool_calls += 1
+                    note = openai_item_status(event.item)
+                    if note:
+                        status(started, note)
+                if event.type in OPENAI_TERMINAL_EVENTS:
+                    response = event.response
+                if (time.monotonic() - started) / 60 >= config["wall_clock_min"]:
+                    stop["budget_exhausted"] = "wall_clock"
+                    break
+        except (openai.APIError, StreamLost) as error:
             stop["error"] = f"{type(error).__name__}: {error}"
+        finally:
+            events.close()
+            # A background response outlives the connection, so stop it rather than leave it billing.
+            if response is None and response_id:
+                cancel_openai_response(client, response_id)
 
         if response is None:
             stop["reason"] = "cut off" if stop["budget_exhausted"] else "error"
@@ -319,6 +334,56 @@ def run_openai(config, prompt):
         "stop": stop,
         "responses": responses,
     }
+
+
+class StreamLost(Exception):
+    """The stream kept dropping and every reconnect attempt failed."""
+
+
+def openai_events(client, request, started):
+    """Yield every event of one background response, reconnecting if the stream drops.
+
+    A run is one response that streams for half an hour or more, mostly silent while code
+    runs, and that connection can close before the terminal event arrives. Background mode
+    keeps the response alive server-side, so the stream is reopened by id and the SDK skips
+    events at or before the last sequence number already seen.
+    """
+    response_id = None
+    last_seq = None
+    for attempt in range(STREAM_RESUMES + 1):
+        if response_id is None:
+            manager = client.responses.stream(**request, background=True)
+        else:
+            manager = client.responses.stream(
+                response_id=response_id,
+                starting_after=last_seq,
+                include=request["include"],
+                tools=request["tools"],
+            )
+        try:
+            with manager as stream:
+                for event in stream:
+                    last_seq = event.sequence_number
+                    if event.type == "response.created":
+                        response_id = event.response.id
+                    yield event
+                    if event.type in OPENAI_TERMINAL_EVENTS:
+                        return
+            dropped = "stream closed before the response finished"
+        except openai.APIConnectionError as error:
+            dropped = f"{type(error).__name__}: {error}"
+        if response_id is None:
+            raise StreamLost(f"{dropped} (before a response id arrived)")
+        status(started, f"{dropped} · reconnecting after event {last_seq}")
+        time.sleep(min(2**attempt, 30))
+    raise StreamLost(f"gave up after {STREAM_RESUMES} reconnects to {response_id}")
+
+
+def cancel_openai_response(client, response_id):
+    try:
+        client.responses.cancel(response_id)
+    except openai.APIError:
+        pass  # already finished, or the cancel itself failed; nothing more to do here
 
 
 def add_openai_usage(totals, usage):
