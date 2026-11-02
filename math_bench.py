@@ -26,7 +26,7 @@ from model_calls import (
 
 PROMPT_VERSION = "math-v2"
 HERE = Path(__file__).resolve().parent
-OUTPUT_DIR = HERE / "math"
+OUTPUT_DIR = HERE / "out/math"
 
 # Section 10: phrases that suggest the model recalled the paper.
 CONTAMINATION_PATTERNS = [
