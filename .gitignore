@@ -11,3 +11,6 @@ __pycache__/
 
 #pycharm
 .idea
+
+# Outputs
+out/
