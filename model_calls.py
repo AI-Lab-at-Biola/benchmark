@@ -267,7 +267,8 @@ def run_openai(config, prompt):
         blocks = []
         response = None
         response_id = None
-        events = openai_events(client, request, started)
+        deadline = started + config["wall_clock_min"] * 60
+        events = openai_events(client, request, started, deadline)
         try:
             for event in events:
                 activity["last"] = time.monotonic()
@@ -294,6 +295,8 @@ def run_openai(config, prompt):
                 cancel_openai_response(client, response_id)
 
         if response is None:
+            if not stop["error"] and not stop["budget_exhausted"]:
+                stop["budget_exhausted"] = "wall_clock"  # openai_events ran out of time reconnecting
             stop["reason"] = "cut off" if stop["budget_exhausted"] else "error"
             responses.append({"stop_reason": stop["reason"], "blocks": blocks})
             break
@@ -340,13 +343,14 @@ class StreamLost(Exception):
     """The stream kept dropping and every reconnect attempt failed."""
 
 
-def openai_events(client, request, started):
+def openai_events(client, request, started, deadline):
     """Yield every event of one background response, reconnecting if the stream drops.
 
     A run is one response that streams for half an hour or more, mostly silent while code
     runs, and that connection can close before the terminal event arrives. Background mode
     keeps the response alive server-side, so the stream is reopened by id and the SDK skips
-    events at or before the last sequence number already seen.
+    events at or before the last sequence number already seen. Reconnecting stops at
+    `deadline` (a time.monotonic() value), so backoff never outlasts the wall-clock budget.
     """
     response_id = None
     last_seq = None
@@ -354,11 +358,10 @@ def openai_events(client, request, started):
         if response_id is None:
             manager = client.responses.stream(**request, background=True)
         else:
+            # The SDK rejects any other argument alongside response_id/starting_after.
             manager = client.responses.stream(
                 response_id=response_id,
                 starting_after=last_seq,
-                include=request["include"],
-                tools=request["tools"],
             )
         try:
             with manager as stream:
@@ -375,7 +378,10 @@ def openai_events(client, request, started):
         if response_id is None:
             raise StreamLost(f"{dropped} (before a response id arrived)")
         status(started, f"{dropped} · reconnecting after event {last_seq}")
-        time.sleep(min(2**attempt, 30))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(2**attempt, 30, remaining))
     raise StreamLost(f"gave up after {STREAM_RESUMES} reconnects to {response_id}")
 
 
