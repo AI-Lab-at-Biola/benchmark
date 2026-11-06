@@ -355,11 +355,18 @@ def openai_events(client, request, started, deadline):
     response_id = None
     last_seq = None
     for attempt in range(STREAM_RESUMES + 1):
+        # Recheck after backoff too: sleeping can consume the entire remaining budget.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        # Apply the remaining timeout to both creation and resumption requests.
+        # Only this loop retries; SDK retries would reuse a stale timeout budget.
+        attempt_client = client.with_options(timeout=remaining, max_retries=0)
         if response_id is None:
-            manager = client.responses.stream(**request, background=True)
+            manager = attempt_client.responses.stream(**request, background=True)
         else:
-            # The SDK rejects any other argument alongside response_id/starting_after.
-            manager = client.responses.stream(
+            # Resume by id without repeating the response creation arguments.
+            manager = attempt_client.responses.stream(
                 response_id=response_id,
                 starting_after=last_seq,
             )
@@ -375,8 +382,13 @@ def openai_events(client, request, started, deadline):
             dropped = "stream closed before the response finished"
         except openai.APIConnectionError as error:
             dropped = f"{type(error).__name__}: {error}"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
         if response_id is None:
             raise StreamLost(f"{dropped} (before a response id arrived)")
+        if attempt == STREAM_RESUMES:
+            break
         status(started, f"{dropped} · reconnecting after event {last_seq}")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -387,7 +399,8 @@ def openai_events(client, request, started, deadline):
 
 def cancel_openai_response(client, response_id):
     try:
-        client.responses.cancel(response_id)
+        # Cancellation needs its own short allowance once the run budget is exhausted.
+        client.with_options(timeout=10, max_retries=0).responses.cancel(response_id)
     except openai.APIError:
         pass  # already finished, or the cancel itself failed; nothing more to do here
 
