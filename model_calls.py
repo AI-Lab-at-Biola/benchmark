@@ -4,6 +4,7 @@ run_model drives Claude through the Messages API with Anthropic's code execution
 run_openai drives OpenAI models through the Responses API with OpenAI's code interpreter.
 """
 
+import asyncio
 import threading
 import time
 
@@ -220,12 +221,21 @@ def block_record(block):
 
 
 def run_openai(config, prompt):
+    """Synchronous entry point for the OpenAI benchmark."""
+    return asyncio.run(run_openai_async(config, prompt))
+
+
+async def run_openai_async(config, prompt):
+    async with openai.AsyncOpenAI() as client:
+        return await openai_run(client, config, prompt)
+
+
+async def openai_run(client, config, prompt):
     """run_model's counterpart for OpenAI: the Responses API with its code interpreter.
 
     The server runs the whole tool loop inside one response (there is no pause_turn), so the
     wall clock is also checked while streaming, and max_tool_calls is enforced by the API.
     """
-    client = openai.OpenAI()
     next_input = prompt
     previous_id = (
         None  # the server keeps the conversation; each request points at the last one
@@ -243,88 +253,95 @@ def run_openai(config, prompt):
     ).start()
     status(started, f"run started · {config['model']} · effort {config['effort']}")
 
-    while True:
-        stop["budget_exhausted"] = budget_exhausted(
-            config, started, tool_calls, usage["output"]
-        )
-        if stop["budget_exhausted"]:
-            break
-
-        remaining_tokens = config["max_output_tokens"] - usage["output"]
-        request = dict(
-            model=config["model"],
-            input=next_input,
-            reasoning={"effort": config["effort"], "summary": "auto"},
-            tools=[OPENAI_CODE_TOOL],
-            include=["code_interpreter_call.outputs"],
-            max_output_tokens=min(MAX_TOKENS_PER_RESPONSE, remaining_tokens),
-            max_tool_calls=config["max_tool_calls"] - tool_calls,
-        )
-        if previous_id:
-            request["previous_response_id"] = previous_id
-
-        # Items are recorded as they finish, so a run cut off mid-response keeps its transcript.
-        blocks = []
-        response = None
-        response_id = None
-        deadline = started + config["wall_clock_min"] * 60
-        events = openai_events(client, request, started, deadline)
-        try:
-            for event in events:
-                activity["last"] = time.monotonic()
-                if event.type == "response.created":
-                    response_id = event.response.id
-                if event.type == "response.output_item.done":
-                    blocks += openai_item_records(event.item)
-                    if event.item.type == "code_interpreter_call":
-                        tool_calls += 1
-                    note = openai_item_status(event.item)
-                    if note:
-                        status(started, note)
-                if event.type in OPENAI_TERMINAL_EVENTS:
-                    response = event.response
-                if (time.monotonic() - started) / 60 >= config["wall_clock_min"]:
-                    stop["budget_exhausted"] = "wall_clock"
-                    break
-        except (openai.APIError, StreamLost) as error:
-            stop["error"] = f"{type(error).__name__}: {error}"
-        finally:
-            events.close()
-            # A background response outlives the connection, so stop it rather than leave it billing.
-            if response is None and response_id:
-                cancel_openai_response(client, response_id)
-
-        if response is None:
-            if not stop["error"] and not stop["budget_exhausted"]:
-                stop["budget_exhausted"] = "wall_clock"  # openai_events ran out of time reconnecting
-            stop["reason"] = "cut off" if stop["budget_exhausted"] else "error"
-            responses.append({"stop_reason": stop["reason"], "blocks": blocks})
-            break
-
-        served_model = response.model
-        add_openai_usage(usage, response.usage)
-        reason = response.status
-        if response.incomplete_details and response.incomplete_details.reason:
-            reason = f"incomplete: {response.incomplete_details.reason}"
-        if response.error:
-            stop["error"] = f"{response.error.code}: {response.error.message}"
-        responses.append({"stop_reason": reason, "blocks": blocks})
-        stop["reason"] = reason
-        status(
-            started,
-            f"response {len(responses)} · {reason} · "
-            f"{tool_calls} code runs · {usage['output']:,} output tokens",
-        )
-
-        if reason == "incomplete: max_output_tokens":
-            previous_id = response.id
-            next_input = (
-                "You hit the per-response output limit. Continue where you left off."
+    try:
+        while True:
+            stop["budget_exhausted"] = budget_exhausted(
+                config, started, tool_calls, usage["output"]
             )
-            continue
-        break  # completed, failed, content filter, or anything unexpected
+            if stop["budget_exhausted"]:
+                break
 
-    finished.set()
+            remaining_tokens = config["max_output_tokens"] - usage["output"]
+            request = dict(
+                model=config["model"],
+                input=next_input,
+                reasoning={"effort": config["effort"], "summary": "auto"},
+                tools=[OPENAI_CODE_TOOL],
+                include=["code_interpreter_call.outputs"],
+                max_output_tokens=min(MAX_TOKENS_PER_RESPONSE, remaining_tokens),
+                max_tool_calls=config["max_tool_calls"] - tool_calls,
+            )
+            if previous_id:
+                request["previous_response_id"] = previous_id
+
+            # Items are recorded as they finish, so a run cut off mid-response keeps its transcript.
+            blocks = []
+            response = None
+            response_id = None
+            deadline = started + config["wall_clock_min"] * 60
+            events = openai_events(client, request, started, deadline)
+            try:
+                # Socket timeouts restart on each read. This deadline also interrupts
+                # a silent read or transport keepalives that never yield model events.
+                async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                    async for event in events:
+                        activity["last"] = time.monotonic()
+                        if event.type == "response.created":
+                            response_id = event.response.id
+                        if event.type == "response.output_item.done":
+                            blocks += openai_item_records(event.item)
+                            if event.item.type == "code_interpreter_call":
+                                tool_calls += 1
+                            note = openai_item_status(event.item)
+                            if note:
+                                status(started, note)
+                        if event.type in OPENAI_TERMINAL_EVENTS:
+                            response = event.response
+                        if time.monotonic() >= deadline:
+                            stop["budget_exhausted"] = "wall_clock"
+                            break
+            except TimeoutError:
+                stop["budget_exhausted"] = "wall_clock"
+            except (openai.APIError, StreamLost) as error:
+                stop["error"] = f"{type(error).__name__}: {error}"
+            finally:
+                await events.aclose()
+                # A background response outlives the connection, so stop it rather than leave it billing.
+                if response is None and response_id:
+                    await cancel_openai_response(client, response_id)
+
+            if response is None:
+                if not stop["error"] and not stop["budget_exhausted"]:
+                    stop["budget_exhausted"] = (
+                        "wall_clock"  # openai_events ran out of time reconnecting
+                    )
+                stop["reason"] = "cut off" if stop["budget_exhausted"] else "error"
+                responses.append({"stop_reason": stop["reason"], "blocks": blocks})
+                break
+
+            served_model = response.model
+            add_openai_usage(usage, response.usage)
+            reason = response.status
+            if response.incomplete_details and response.incomplete_details.reason:
+                reason = f"incomplete: {response.incomplete_details.reason}"
+            if response.error:
+                stop["error"] = f"{response.error.code}: {response.error.message}"
+            responses.append({"stop_reason": reason, "blocks": blocks})
+            stop["reason"] = reason
+            status(
+                started,
+                f"response {len(responses)} · {reason} · "
+                f"{tool_calls} code runs · {usage['output']:,} output tokens",
+            )
+
+            if reason == "incomplete: max_output_tokens":
+                previous_id = response.id
+                next_input = "You hit the per-response output limit. Continue where you left off."
+                continue
+            break  # completed, failed, content filter, or anything unexpected
+
+    finally:
+        finished.set()
     status(
         started,
         f"run ended · {stop['budget_exhausted'] or stop['error'] or stop['reason']}",
@@ -343,7 +360,7 @@ class StreamLost(Exception):
     """The stream kept dropping and every reconnect attempt failed."""
 
 
-def openai_events(client, request, started, deadline):
+async def openai_events(client, request, started, deadline):
     """Yield every event of one background response, reconnecting if the stream drops.
 
     A run is one response that streams for half an hour or more, mostly silent while code
@@ -371,8 +388,8 @@ def openai_events(client, request, started, deadline):
                 starting_after=last_seq,
             )
         try:
-            with manager as stream:
-                for event in stream:
+            async with manager as stream:
+                async for event in stream:
                     last_seq = event.sequence_number
                     if event.type == "response.created":
                         response_id = event.response.id
@@ -393,15 +410,18 @@ def openai_events(client, request, started, deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
-        time.sleep(min(2**attempt, 30, remaining))
+        await asyncio.sleep(min(2**attempt, 30, remaining))
     raise StreamLost(f"gave up after {STREAM_RESUMES} reconnects to {response_id}")
 
 
-def cancel_openai_response(client, response_id):
+async def cancel_openai_response(client, response_id):
     try:
         # Cancellation needs its own short allowance once the run budget is exhausted.
-        client.with_options(timeout=10, max_retries=0).responses.cancel(response_id)
-    except openai.APIError:
+        async with asyncio.timeout(10):
+            await client.with_options(timeout=10, max_retries=0).responses.cancel(
+                response_id
+            )
+    except (openai.APIError, TimeoutError):
         pass  # already finished, or the cancel itself failed; nothing more to do here
 
 
