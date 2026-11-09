@@ -1,13 +1,15 @@
-"""Math track: Maximizing stable matchings (docs/math/starter_doc.md).
+"""Math track: Maximizing stable matchings (docs/math/math_v4.md).
 
-Run once a day:  uv run math_bench.py
+Run manually: uv run math_bench.py (preview with --dry-run)
 Config comes from .env; MATH_PROVIDER picks Anthropic or OpenAI.
-Writes ./math/<datetime>_<model>/run.json and run.md.
+Writes ./out/math/<datetime>_<model>/run.json and run.md.
 """
 
+import argparse
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import sys
@@ -22,9 +24,10 @@ from model_calls import (
     OPENAI_CODE_TOOL,
     run_model,
     run_openai,
+    usage_status,
 )
 
-PROMPT_VERSION = "math-v2"
+PROMPT_VERSION = "math-v4"
 HERE = Path(__file__).resolve().parent
 OUTPUT_DIR = HERE / "out/math"
 
@@ -45,73 +48,97 @@ ORDER_7_TIERS = [(82, 5), (81, 4), (71, 3), (39, 2), (11, 1), (0, 0)]
 # --- Config -------------------------------------------------------------------------------------
 
 
-def load_config():
+def load_config(*, dry_run=False):
     load_dotenv(HERE / ".env")
     provider = os.environ.get("MATH_PROVIDER", "").strip()
     if provider not in API_KEY_VARS:
         sys.exit(f"MATH_PROVIDER in .env must be one of: {', '.join(API_KEY_VARS)}")
     required = [
-        API_KEY_VARS[provider],
         "MATH_MODEL",
         "MATH_EFFORT",
         "MATH_ORDER",
-        "MATH_TARGET",
-        "MATH_PREVIOUS_BEST",
         "MATH_WALL_CLOCK_MIN",
         "MATH_MAX_OUTPUT_TOKENS",
         "MATH_MAX_TOOL_CALLS",
     ]
+    if not dry_run:
+        required.append(API_KEY_VARS[provider])
     missing = [key for key in required if not os.environ.get(key, "").strip()]
     if missing:
         sys.exit(f"Missing from .env: {', '.join(missing)}")
-    return {
-        "provider": provider,
-        "model": os.environ["MATH_MODEL"].strip(),
-        "effort": os.environ["MATH_EFFORT"].strip(),
-        "order": int(os.environ["MATH_ORDER"]),
-        "target": int(os.environ["MATH_TARGET"]),
-        "previous_best": int(os.environ["MATH_PREVIOUS_BEST"]),
-        "wall_clock_min": float(os.environ["MATH_WALL_CLOCK_MIN"]),
-        "max_output_tokens": int(os.environ["MATH_MAX_OUTPUT_TOKENS"]),
-        "max_tool_calls": int(os.environ["MATH_MAX_TOOL_CALLS"]),
-    }
+    model = os.environ["MATH_MODEL"].strip()
+    try:
+        config = {
+            "provider": provider,
+            "model": model,
+            "effort": os.environ["MATH_EFFORT"].strip(),
+            "order": int(os.environ["MATH_ORDER"]),
+            "target": optional_int("MATH_TARGET"),
+            "previous_best": optional_int("MATH_PREVIOUS_BEST"),
+            "wall_clock_min": float(os.environ["MATH_WALL_CLOCK_MIN"]),
+            "max_output_tokens": int(os.environ["MATH_MAX_OUTPUT_TOKENS"]),
+            "max_tool_calls": int(os.environ["MATH_MAX_TOOL_CALLS"]),
+        }
+    except ValueError as exc:
+        sys.exit(f"Invalid numeric configuration: {exc}")
+    for key in ("order", "wall_clock_min", "max_output_tokens", "max_tool_calls"):
+        if not math.isfinite(config[key]) or config[key] <= 0:
+            sys.exit(f"{key} must be positive and finite")
+    if config["max_output_tokens"] < 1024:
+        sys.exit("max_output_tokens must be at least 1024")
+    for key in ("target", "previous_best"):
+        if config[key] is not None and config[key] < 0:
+            sys.exit(f"{key} must be nonnegative when configured")
+    return config
 
 
-# --- Prompt (Section 5) ------------------------------------------------------------------------
+def optional_int(name):
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else None
+
+
+# --- Prompt ----------------------------------------------------------------------------------
 
 
 def build_prompt(config):
     n = config["order"]
-    return f"""
-    You are working on an open research problem in combinatorics. Nobody knows the answer.
+    comparisons = []
+    if config.get("target") is not None:
+        comparisons.append(f"Configured comparison target: {config['target']}.")
+    if config.get("previous_best") is not None:
+        comparisons.append(
+            f"Configured previous-run comparison: {config['previous_best']}."
+        )
+    context = " ".join(comparisons)
+    if context:
+        context += (
+            " These are supplied comparison values, not verified research records."
+        )
+    else:
+        context = "No comparison target is supplied; report the best count you verify."
+    return f"""## Problem
 
-## Problem
+Find an order-{n} stable marriage instance with as many stable matchings as you can.
+Both sides are indexed 0..{n - 1}.
+- M[i][j] is man i's rank of woman j. Each of its {n} rows is a permutation of 1..{n}.
+- W[i][j] is woman j's rank of man i. Each of its {n} columns is a permutation of 1..{n}.
+- Rank 1 is most preferred. A perfect matching is stable if no unmatched pair prefers each other to their assigned partners.
 
-An order-{n} stable marriage instance has {n} men and {n} women (both indexed 0..{n - 1}).
+{context}
 
-- Men's matrix M ({n}x{n}): M[i][j] is the rank man i gives woman j. Each row is a permutation of 1..{n}. Rank 1 is most preferred.
-- Women's matrix W ({n}x{n}): W[i][j] is the rank woman j gives man i. Each column is a permutation of 1..{n}. Rank 1 is most preferred.
-- Example (n=3): men row [2, 1, 3] means man 0 likes woman 1 best, then woman 0, then woman 2.
-- A perfect matching is stable if there is no man i and woman j, not matched to each other, who both rank each other better than their assigned partners.
+## Environment and budget
 
-Objective: find (M, W) that maximizes the number of stable matchings.
+Use the provided Python code sandbox. Do not use internet access or install packages.
+Write your own code, including the stable-matching counter.
+The run budget is {config["wall_clock_min"]:g} minutes, {config["max_tool_calls"]} tool calls,
+and {config["max_output_tokens"]:,} output tokens in total. Reserve time and tokens for verification and your final answer.
+Keep the strategy explanation, progress text, and tool output brief. Do not print long search logs or repeat candidate matrices.
 
-## Context
+## Instructions
 
-For order {n}, the best known value is {config["target"]}. The long-standing bound before that was {config["previous_best"]}. Matching {config["target"]} is excellent; beating it would be a new result. The true maximum is unknown.
-
-## Environment
-
-You have a code execution sandbox (Python; 1 CPU). There is no internet access and you cannot install packages. Write your own code for everything, including counting stable matchings.
-
-Budget for this run: about {config["wall_clock_min"]:.0f} minutes wall-clock, {config["max_tool_calls"]} tool calls, and {config["max_output_tokens"]:,} output tokens in total. The run is cut off when any of these runs out, so leave room to report your answer.
-
-## What to do
-
-1. Before running anything, explain your strategy and why you expect it to work. 
-	1. Do *NOT* use simulated annealing as your method of choice
-2. Verify every candidate you report by counting its stable matchings with code.
-3. Finish with exactly one fenced JSON block in this format, using the conventions above:
+1. Briefly state your strategy before executing code. Do NOT use simulated annealing as your method of choice.
+2. Count stable matchings with code for every candidate you report. Do not claim optimality without a proof.
+3. Finish with exactly one fenced JSON block below, replacing placeholders with actual integer matrices and the verified count. Include count confidence in the short strategy summary.
 
 ```json
 {{
@@ -119,11 +146,9 @@ Budget for this run: about {config["wall_clock_min"]:.0f} minutes wall-clock, {c
   "men": [[...{n} ints...], ...{n} rows...],
   "women": [[...{n} ints...], ...{n} rows...],
   "claimed_stable_matchings": <int>,
-  "strategy_summary": "2-5 sentences"
+  "strategy_summary": "Brief strategy and confidence in the count"
 }}
 ```
-
-4. State your confidence in the count. Do not claim your answer is optimal unless you have a proof.
 """
 
 
@@ -237,7 +262,7 @@ def score(config, run):
         verified_phi=phi,
         tier=tier_for(phi, config["order"]),
         honesty_flag=result["claimed_phi"] != phi,
-        escalate=phi > config["target"],
+        escalate=config.get("target") is not None and phi > config["target"],
     )
     return result
 
@@ -330,9 +355,9 @@ def write_markdown(path, config, prompt, run, result, started):
         ("Effort · prompt version", f"{config['effort']} · {PROMPT_VERSION}"),
         (
             "Tokens",
-            f"input {usage['input']:,} · output {usage['output']:,} "
-            f"(thinking {usage['thinking']:,}) · cache read {usage['cache_read']:,} "
-            f"· cache write {usage['cache_write']:,}",
+            usage_status(
+                usage, config["provider"], complete=run.get("usage_complete", True)
+            ),
         ),
         (
             "Tool calls · wall-clock",
@@ -388,15 +413,28 @@ def write_markdown(path, config, prompt, run, result, started):
 
 
 def run_dir(started, model):
-    """./math/<datetime>_<model>/, one folder per run."""
+    """./out/math/<datetime>_<model>/, one folder per run."""
     path = OUTPUT_DIR / f"{started:%Y-%m-%d_%H%M%S}_{model}"
     path.mkdir(parents=True)
     return path
 
 
-def main():
-    config = load_config()
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview configuration and prompt without API calls or output files",
+    )
+    args = parser.parse_args(argv)
+    config = load_config(dry_run=args.dry_run)
     prompt = build_prompt(config)
+    if args.dry_run:
+        print(
+            json.dumps({"prompt_version": PROMPT_VERSION, "config": config}, indent=2)
+        )
+        print("\n" + prompt)
+        return
     started = datetime.now().astimezone()
     is_openai = config["provider"] == "openai"
     run = run_openai(config, prompt) if is_openai else run_model(config, prompt)
@@ -419,6 +457,11 @@ def main():
         result["verified_phi"]
         if result["valid"]
         else f"invalid ({result['invalid_reason']})"
+    )
+    print(
+        usage_status(
+            run["usage"], config["provider"], complete=run.get("usage_complete", True)
+        )
     )
     print(f"verified Φ: {phi} · claimed: {result['claimed_phi']} · {out}")
     if result["escalate"]:

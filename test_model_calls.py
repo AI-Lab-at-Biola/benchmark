@@ -2,8 +2,10 @@ import asyncio
 import json
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import anthropic
 import httpx2
 import openai
 
@@ -232,6 +234,32 @@ class OpenAIDeadlineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.requests), 3)
         self.assertEqual(self.requests[-1].extensions["timeout"]["read"], 6.75)
 
+    async def test_raw_transport_error_reconnects_same_response(self):
+        class BrokenStream(EventStream):
+            async def __aiter__(self):
+                async for chunk in super().__aiter__():
+                    yield chunk
+                raise httpx2.ReadError("connection reset")
+
+        async def broken(request):
+            return httpx2.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=BrokenStream([response_event("response.created", 0)]),
+            )
+
+        self.actions = [
+            broken,
+            [
+                response_event("response.created", 0),
+                response_event("response.completed", 1),
+            ],
+        ]
+        result = await self.run_model(10)
+        self.assertEqual(result["stop"]["reason"], "completed")
+        self.assertEqual([request.method for request in self.requests], ["POST", "GET"])
+        self.assertEqual(self.requests[1].url.path, "/v1/responses/resp_test")
+
     async def test_retry_limit_reports_stream_lost_without_final_sleep(self):
         self.actions = [[response_event("response.created", 0)], [], []]
         with patch("model_calls.STREAM_RESUMES", 2):
@@ -264,6 +292,32 @@ class OpenAIDeadlineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OpenAIBlockedStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        # Warm the SDK's lazy event decoder outside the sub-second deadline.
+        # A cold schema build can otherwise consume the entire test budget before
+        # the checkpoint arrives (also reproducible on the unmodified runner).
+        async def handle(request):
+            return httpx2.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=EventStream(
+                    [
+                        response_event("response.created", 0),
+                        response_event("response.completed", 1),
+                    ]
+                ),
+            )
+
+        async with openai.AsyncOpenAI(
+            api_key="test-key",
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handle)),
+        ) as client:
+            now = time.monotonic()
+            async for _ in model_calls.openai_events(
+                client, {"model": "test-model", "input": "test"}, now, now + 10
+            ):
+                pass
+
     async def run_stream(self, mode):
         requests = []
         streams = []
@@ -412,6 +466,340 @@ class OpenAISyncEntryTests(unittest.TestCase):
             )
         self.assertEqual(result["stop"]["reason"], "completed")
         self.assertTrue(client.is_closed())
+
+
+class UsageTests(unittest.TestCase):
+    def test_anthropic_cumulative_snapshots_are_not_added(self):
+        tracker = model_calls.UsageTracker("anthropic")
+        tracker.begin()
+        tracker.observe(
+            SimpleNamespace(
+                input_tokens=100,
+                output_tokens=1,
+                cache_read_input_tokens=20,
+                cache_creation_input_tokens=30,
+            )
+        )
+        tracker.observe(SimpleNamespace(output_tokens=10))
+        tracker.observe(SimpleNamespace(output_tokens=20))
+        self.assertEqual(tracker.snapshot()["output"], 20)
+        self.assertIn("input 150", tracker.summary())
+        self.assertIn("incomplete", tracker.summary())
+        final = SimpleNamespace(
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_input_tokens=20,
+            cache_creation_input_tokens=30,
+        )
+        self.assertTrue(tracker.finish(final)["usage_complete"])
+        tracker.begin()
+        tracker.finish(SimpleNamespace(input_tokens=50, output_tokens=7))
+        self.assertEqual(
+            tracker.snapshot(),
+            dict(input=150, output=27, cache_read=20, cache_write=30, thinking=0),
+        )
+        self.assertIn("input 200", tracker.summary())
+        self.assertNotIn("incomplete", tracker.summary())
+
+    def test_openai_cache_and_thinking_are_subsets_not_extra_tokens(self):
+        tracker = model_calls.UsageTracker("openai")
+        tracker.begin()
+        tracker.finish(
+            SimpleNamespace(
+                input_tokens=100,
+                output_tokens=20,
+                input_tokens_details=SimpleNamespace(cached_tokens=50),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=15),
+            )
+        )
+        self.assertIn("input 100", tracker.summary())
+        self.assertIn("output 20", tracker.summary())
+        self.assertEqual(tracker.snapshot()["thinking"], 15)
+
+    def test_missing_usage_stays_incomplete_after_later_complete_response(self):
+        tracker = model_calls.UsageTracker("anthropic")
+        tracker.begin()
+        tracker.observe(SimpleNamespace(input_tokens=80, output_tokens=5))
+        self.assertFalse(tracker.finish()["usage_complete"])
+        tracker.begin()
+        tracker.finish(SimpleNamespace(input_tokens=10, output_tokens=2))
+        self.assertEqual(tracker.snapshot()["output"], 7)
+        self.assertFalse(tracker.complete)
+        self.assertIn("incomplete", tracker.summary())
+
+    def test_heartbeat_and_status_include_latest_reported_input_output(self):
+        tracker = model_calls.UsageTracker("anthropic")
+        tracker.begin()
+        tracker.observe(SimpleNamespace(input_tokens=80, output_tokens=5))
+        finished = Mock()
+        finished.wait.side_effect = [False, True]
+        with (
+            patch("model_calls.time.monotonic", return_value=180),
+            patch("builtins.print") as output,
+        ):
+            model_calls.heartbeat(0, {"last": 0, "tracker": tracker}, finished)
+        message = output.call_args.args[0]
+        self.assertIn("input 80", message)
+        self.assertIn("output 5", message)
+        self.assertIn("incomplete", message)
+
+
+def anthropic_events(stop="end_turn", input_tokens=100, output_tokens=20, tool=False):
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-fable-5-2",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 10,
+                    "cache_creation_input_tokens": 5,
+                },
+            },
+        }
+    ]
+    if tool:
+        block = {
+            "type": "server_tool_use",
+            "id": "srvtoolu_test",
+            "name": "bash_code_execution",
+            "input": {"command": "echo test"},
+        }
+        delta = {"type": "input_json_delta", "partial_json": ""}
+    else:
+        block = {"type": "text", "text": ""}
+        delta = {"type": "text_delta", "text": "checkpoint"}
+    events += [
+        {"type": "content_block_start", "index": 0, "content_block": block},
+        {"type": "content_block_delta", "index": 0, "delta": delta},
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        },
+        {"type": "message_stop"},
+    ]
+    return events
+
+
+class AnthropicEventStream(EventStream):
+    async def __aiter__(self):
+        for event in self.events:
+            yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+
+
+class AnthropicStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def run_events(self, batches, **changes):
+        requests, streams, updates = [], [], []
+
+        async def handle(request):
+            requests.append(request)
+            batch = batches.pop(0)
+            if callable(batch):
+                response = await batch(request)
+            else:
+                response = httpx2.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=AnthropicEventStream(batch),
+                )
+            streams.append(response)
+            return response
+
+        async with anthropic.AsyncAnthropic(
+            api_key="test-key",
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handle)),
+        ) as client:
+            with patch(
+                "model_calls.status",
+                side_effect=lambda started, text, tracker=None: updates.append(
+                    text + (" " + tracker.summary() if tracker else "")
+                ),
+            ):
+                result = await model_calls.anthropic_run(
+                    client,
+                    {
+                        "model": "claude-fable-5-2",
+                        "effort": "high",
+                        "wall_clock_min": 1,
+                        "max_output_tokens": 16000,
+                        "max_tool_calls": 30,
+                        **changes,
+                    },
+                    "test",
+                )
+        self.assertTrue(all(stream.is_closed for stream in streams))
+        return result, requests, updates
+
+    async def test_final_usage_replaces_snapshots_and_continuations_sum(self):
+        result, requests, updates = await self.run_events(
+            [
+                anthropic_events("pause_turn"),
+                anthropic_events(input_tokens=200, output_tokens=30),
+            ]
+        )
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(result["usage"]["input"], 300)
+        self.assertEqual(result["usage"]["output"], 50)
+        self.assertEqual(result["usage"]["cache_read"], 20)
+        self.assertTrue(result["usage_complete"])
+        second = json.loads(requests[1].content)
+        self.assertEqual(second["max_tokens"], 15980)
+        self.assertEqual(len(second["messages"]), 2)
+        self.assertIn("input 330", updates[-1])
+        self.assertIn("output 50", updates[-1])
+        self.assertIn("input 115", updates[1])
+        self.assertIn("incomplete", updates[1])
+
+    async def test_dropped_stream_keeps_reported_usage_and_checkpoint(self):
+        result, requests, _ = await self.run_events([anthropic_events()[:-1]])
+        self.assertEqual(len(requests), 1)
+        self.assertFalse(result["usage_complete"])
+        self.assertEqual(result["usage"]["output"], 20)
+        self.assertIn("StreamLost", result["stop"]["error"])
+        self.assertEqual(
+            result["responses"][0]["blocks"], [{"type": "text", "text": "checkpoint"}]
+        )
+
+    async def test_transport_reset_keeps_partial_usage_and_transcript(self):
+        class BrokenStream(AnthropicEventStream):
+            async def __aiter__(self):
+                async for chunk in super().__aiter__():
+                    yield chunk
+                raise httpx2.ReadError("connection reset")
+
+        async def broken(request):
+            return httpx2.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=BrokenStream(anthropic_events()[:4]),
+            )
+
+        result, requests, updates = await self.run_events([broken])
+        self.assertEqual(len(requests), 1)
+        self.assertFalse(result["usage_complete"])
+        self.assertEqual(result["usage"]["input"], 100)
+        self.assertEqual(result["usage"]["output"], 1)
+        self.assertIn("ReadError", result["stop"]["error"])
+        self.assertEqual(result["responses"][0]["blocks"][0]["text"], "checkpoint")
+        self.assertIn("incomplete", updates[-1])
+
+    async def test_tool_cap_interrupts_inside_response(self):
+        result, requests, _ = await self.run_events(
+            [anthropic_events(tool=True)], max_tool_calls=1
+        )
+        self.assertEqual(result["stop"]["budget_exhausted"], "tool_calls")
+        self.assertEqual(result["tool_calls"], 1)
+        self.assertFalse(result["usage_complete"])
+        self.assertEqual(len(requests), 1)
+
+    async def test_output_cap_does_not_start_continuation(self):
+        result, requests, _ = await self.run_events(
+            [anthropic_events("max_tokens", output_tokens=16000)]
+        )
+        self.assertEqual(result["stop"]["budget_exhausted"], "output_tokens")
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(result["usage_complete"])
+
+    async def test_silent_stream_and_headers_obey_deadline(self):
+        # Warm Anthropic's lazy decoder before measuring short deadlines.
+        await self.run_events([anthropic_events()])
+        for mode in ("silent", "keepalives", "headers"):
+            with self.subTest(mode=mode):
+
+                class SlowStream(httpx2.AsyncByteStream):
+                    async def __aiter__(self):
+                        for event in anthropic_events()[:4]:
+                            yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                        if mode == "keepalives":
+                            while True:
+                                await asyncio.sleep(0.01)
+                                yield b": ping\n\n"
+                        await asyncio.sleep(2)
+
+                async def slow(request):
+                    if mode == "headers":
+                        await asyncio.sleep(2)
+                    return httpx2.Response(
+                        200,
+                        headers={"content-type": "text/event-stream"},
+                        stream=SlowStream(),
+                    )
+
+                start = time.monotonic()
+                result, requests, updates = await asyncio.wait_for(
+                    self.run_events([slow], wall_clock_min=0.15 / 60), timeout=1.2
+                )
+                self.assertLess(time.monotonic() - start, 0.9)
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(result["stop"]["budget_exhausted"], "wall_clock")
+                self.assertFalse(result["usage_complete"])
+                self.assertIn("incomplete", updates[-1])
+                if mode != "headers":
+                    self.assertEqual(result["usage"]["input"], 100)
+                    self.assertEqual(
+                        result["responses"][0]["blocks"][0]["text"], "checkpoint"
+                    )
+
+    async def test_expired_deadline_starts_no_request(self):
+        result, requests, _ = await self.run_events([], wall_clock_min=0)
+        self.assertEqual(requests, [])
+        self.assertEqual(result["stop"]["budget_exhausted"], "wall_clock")
+
+
+class OpenAIUsageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_usage_and_missing_usage_are_distinguished(self):
+        for with_usage in (True, False):
+            with self.subTest(with_usage=with_usage):
+                event = response_event("response.completed", 1)
+                if with_usage:
+                    event["response"]["usage"] = {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "total_tokens": 120,
+                        "input_tokens_details": {"cached_tokens": 50},
+                        "output_tokens_details": {"reasoning_tokens": 15},
+                    }
+
+                async def handle(request):
+                    return httpx2.Response(
+                        200,
+                        headers={"content-type": "text/event-stream"},
+                        stream=EventStream(
+                            [response_event("response.created", 0), event]
+                        ),
+                    )
+
+                async with openai.AsyncOpenAI(
+                    api_key="test-key",
+                    http_client=httpx2.AsyncClient(
+                        transport=httpx2.MockTransport(handle)
+                    ),
+                ) as client:
+                    with patch("model_calls.status"):
+                        result = await model_calls.openai_run(
+                            client,
+                            {
+                                "model": "test-model",
+                                "effort": "high",
+                                "wall_clock_min": 1,
+                                "max_tool_calls": 30,
+                                "max_output_tokens": 16000,
+                            },
+                            "test",
+                        )
+                self.assertEqual(result["usage_complete"], with_usage)
+                self.assertEqual(result["usage"]["input"], 100 if with_usage else 0)
+                self.assertEqual(result["usage"]["output"], 20 if with_usage else 0)
+                self.assertEqual(result["responses"][0]["usage_complete"], with_usage)
 
 
 if __name__ == "__main__":
