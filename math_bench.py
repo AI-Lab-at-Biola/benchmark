@@ -27,7 +27,6 @@ from model_calls import (
 PROMPT_VERSION = "math-v2"
 HERE = Path(__file__).resolve().parent
 OUTPUT_DIR = HERE / "out/math"
-WALL_CLOCK_CAP_MIN = 15
 
 # Section 10: phrases that suggest the model recalled the paper.
 CONTAMINATION_PATTERNS = [
@@ -72,9 +71,7 @@ def load_config():
         "order": int(os.environ["MATH_ORDER"]),
         "target": int(os.environ["MATH_TARGET"]),
         "previous_best": int(os.environ["MATH_PREVIOUS_BEST"]),
-        "wall_clock_min": min(
-            float(os.environ["MATH_WALL_CLOCK_MIN"]), WALL_CLOCK_CAP_MIN
-        ),
+        "wall_clock_min": float(os.environ["MATH_WALL_CLOCK_MIN"]),
         "max_output_tokens": int(os.environ["MATH_MAX_OUTPUT_TOKENS"]),
         "max_tool_calls": int(os.environ["MATH_MAX_TOOL_CALLS"]),
     }
