@@ -42,12 +42,14 @@ def budget_exhausted(config, started, tool_calls, output_tokens):
     return None
 
 
-def status(started, message):
+def status(started, message, usage=None):
     elapsed = time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - started))
+    if usage:
+        message += f" · in {usage['input']:,} · out {usage['output']:,}"
     print(f"[{elapsed}] {message}", flush=True)
 
 
-def heartbeat(started, activity, finished, every_s=120):
+def heartbeat(started, activity, finished, usage, every_s=120):
     """Every couple of quiet minutes, say how long it's been since the stream sent anything.
 
     Long code runs in the sandbox are silent, so a quiet stretch alone isn't a stall;
@@ -56,7 +58,9 @@ def heartbeat(started, activity, finished, every_s=120):
     while not finished.wait(every_s):
         quiet_min = (time.monotonic() - activity["last"]) / 60
         if quiet_min >= every_s / 60:
-            status(started, f"still waiting · {quiet_min:.0f} min since last update")
+            status(
+                started, f"still waiting · {quiet_min:.0f} min since last update", usage
+            )
 
 
 # --- Claude ----------------------------------------------------------------------------------
@@ -76,7 +80,7 @@ def run_model(config, prompt):
     activity = {"last": started}  # when the stream last delivered anything
     finished = threading.Event()
     threading.Thread(
-        target=heartbeat, args=(started, activity, finished), daemon=True
+        target=heartbeat, args=(started, activity, finished, usage), daemon=True
     ).start()
     status(started, f"run started · {config['model']} · effort {config['effort']}")
 
@@ -106,7 +110,7 @@ def run_model(config, prompt):
                     if event.type == "content_block_stop":
                         note = block_status(event.content_block)
                         if note:
-                            status(started, note)
+                            status(started, note, usage)
                 response = stream.get_final_message()
         except anthropic.APIError as error:
             stop["error"] = f"{type(error).__name__}: {error}"
@@ -129,8 +133,8 @@ def run_model(config, prompt):
         stop["reason"] = response.stop_reason
         status(
             started,
-            f"response {len(responses)} · {response.stop_reason} · "
-            f"{tool_calls} code runs · {usage['output']:,} output tokens",
+            f"response {len(responses)} · {response.stop_reason} · {tool_calls} code runs",
+            usage,
         )
 
         if response.stop_reason == "pause_turn":
@@ -151,6 +155,7 @@ def run_model(config, prompt):
     status(
         started,
         f"run ended · {stop['budget_exhausted'] or stop['error'] or stop['reason']}",
+        usage,
     )
     return {
         "served_model": served_model,
@@ -249,7 +254,7 @@ async def openai_run(client, config, prompt):
     activity = {"last": started}
     finished = threading.Event()
     threading.Thread(
-        target=heartbeat, args=(started, activity, finished), daemon=True
+        target=heartbeat, args=(started, activity, finished, usage), daemon=True
     ).start()
     status(started, f"run started · {config['model']} · effort {config['effort']}")
 
@@ -294,7 +299,7 @@ async def openai_run(client, config, prompt):
                                 tool_calls += 1
                             note = openai_item_status(event.item)
                             if note:
-                                status(started, note)
+                                status(started, note, usage)
                         if event.type in OPENAI_TERMINAL_EVENTS:
                             response = event.response
                         if time.monotonic() >= deadline:
@@ -330,8 +335,8 @@ async def openai_run(client, config, prompt):
             stop["reason"] = reason
             status(
                 started,
-                f"response {len(responses)} · {reason} · "
-                f"{tool_calls} code runs · {usage['output']:,} output tokens",
+                f"response {len(responses)} · {reason} · {tool_calls} code runs",
+                usage,
             )
 
             if reason == "incomplete: max_output_tokens":
@@ -345,6 +350,7 @@ async def openai_run(client, config, prompt):
     status(
         started,
         f"run ended · {stop['budget_exhausted'] or stop['error'] or stop['reason']}",
+        usage,
     )
     return {
         "served_model": served_model,
