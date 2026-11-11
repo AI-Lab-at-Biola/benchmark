@@ -45,11 +45,12 @@ def budget_exhausted(config, started, tool_calls, output_tokens):
 def status(started, message, usage=None):
     elapsed = time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - started))
     if usage:
-        message += f" · in {usage['input']:,} · out {usage['output']:,}"
+        approx = "~" if usage.get("is_estimate") else ""
+        message += f" · in {usage['input']:,} · out {approx}{usage['output']:,}"
     print(f"[{elapsed}] {message}", flush=True)
 
 
-def heartbeat(started, activity, finished, usage, every_s=120):
+def heartbeat(started, activity, finished, current_usage, every_s=120):
     """Every couple of quiet minutes, say how long it's been since the stream sent anything.
 
     Long code runs in the sandbox are silent, so a quiet stretch alone isn't a stall;
@@ -59,7 +60,9 @@ def heartbeat(started, activity, finished, usage, every_s=120):
         quiet_min = (time.monotonic() - activity["last"]) / 60
         if quiet_min >= every_s / 60:
             status(
-                started, f"still waiting · {quiet_min:.0f} min since last update", usage
+                started,
+                f"still waiting · {quiet_min:.0f} min since last update",
+                current_usage(),
             )
 
 
@@ -67,8 +70,21 @@ def heartbeat(started, activity, finished, usage, every_s=120):
 
 
 def run_model(config, prompt):
-    """Drive the conversation until the model finishes or a budget runs out. Returns the run record."""
-    client = anthropic.Anthropic()
+    """Synchronous entry point for the Claude benchmark."""
+    return asyncio.run(run_model_async(config, prompt))
+
+
+async def run_model_async(config, prompt):
+    async with anthropic.AsyncAnthropic() as client:
+        return await claude_run(client, config, prompt)
+
+
+async def claude_run(client, config, prompt):
+    """Drive the conversation until the model finishes or a budget runs out. Returns the run record.
+
+    The server runs its code-execution loop inside one response, so like openai_run the wall
+    clock is also enforced while streaming.
+    """
     messages = [{"role": "user", "content": prompt}]
     usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "thinking": 0}
     responses = []  # one entry per API request, in order
@@ -78,11 +94,15 @@ def run_model(config, prompt):
     served_model = None
     started = time.monotonic()
     activity = {"last": started}  # when the stream last delivered anything
+    in_flight = {"input": 0, "chars": 0}  # the response currently streaming
     finished = threading.Event()
     threading.Thread(
-        target=heartbeat, args=(started, activity, finished, usage), daemon=True
+        target=heartbeat,
+        args=(started, activity, finished, lambda: live_usage(usage, in_flight)),
+        daemon=True,
     ).start()
     status(started, f"run started · {config['model']} · effort {config['effort']}")
+    deadline = started + config["wall_clock_min"] * 60
 
     while True:
         stop["budget_exhausted"] = budget_exhausted(
@@ -103,26 +123,44 @@ def run_model(config, prompt):
         if container_id:
             request["container"] = container_id
 
+        # Blocks are recorded as they finish, so a run cut off mid-response keeps its transcript.
+        blocks = []
+        response = None
+        remaining = max(0, deadline - time.monotonic())
+        # Only the deadline bounds the request; SDK retries would reuse a stale timeout budget.
+        attempt_client = client.with_options(timeout=remaining, max_retries=0)
         try:
-            with client.messages.stream(**request) as stream:
-                for event in stream:
-                    activity["last"] = time.monotonic()
-                    if event.type == "content_block_stop":
-                        note = block_status(event.content_block)
-                        if note:
-                            status(started, note, usage)
-                response = stream.get_final_message()
+            # Socket timeouts restart on each read, so this also covers a stream that keeps
+            # sending events past the deadline.
+            async with asyncio.timeout(remaining):
+                async with attempt_client.messages.stream(**request) as stream:
+                    async for event in stream:
+                        activity["last"] = time.monotonic()
+                        track_in_flight(in_flight, event)
+                        if event.type == "content_block_stop":
+                            blocks.append(block_record(event.content_block))
+                            if event.content_block.type == "server_tool_use":
+                                tool_calls += 1
+                            note = block_status(event.content_block)
+                            if note:
+                                status(started, note, live_usage(usage, in_flight))
+                    response = await stream.get_final_message()
+        except TimeoutError:
+            stop["budget_exhausted"] = "wall_clock"
         except anthropic.APIError as error:
             stop["error"] = f"{type(error).__name__}: {error}"
+        finally:
+            in_flight.update(input=0, chars=0)
+
+        if response is None:
+            stop["reason"] = "cut off" if stop["budget_exhausted"] else "error"
+            responses.append({"stop_reason": stop["reason"], "blocks": blocks})
             break
 
         served_model = response.model
         if response.container:
             container_id = response.container.id
         add_usage(usage, response.usage)
-        tool_calls += sum(
-            1 for block in response.content if block.type == "server_tool_use"
-        )
         responses.append(
             {
                 "stop_reason": response.stop_reason,
@@ -185,6 +223,30 @@ def block_status(block):
             f"code finished (exit {code})" if code is not None else "code failed to run"
         )
     return None
+
+
+def track_in_flight(in_flight, event):
+    """Usage only arrives at message_start (input) and message_delta (end), and a whole
+    server-side code-execution loop is one response, so count streamed characters meanwhile."""
+    if event.type == "message_start":
+        in_flight["input"] = event.message.usage.input_tokens or 0
+    elif event.type == "content_block_delta":
+        delta = event.delta
+        text = getattr(delta, "text", None) or getattr(delta, "thinking", None)
+        text = text or getattr(delta, "partial_json", None) or ""
+        in_flight["chars"] += len(text)
+
+
+def live_usage(totals, in_flight):
+    """Run totals plus the streaming response: exact input, output estimated at ~4 chars/token."""
+    if not in_flight["input"] and not in_flight["chars"]:
+        return totals
+    return {
+        **totals,
+        "input": totals["input"] + in_flight["input"],
+        "output": totals["output"] + in_flight["chars"] // 4,
+        "is_estimate": True,
+    }
 
 
 def add_usage(totals, usage):
@@ -254,7 +316,9 @@ async def openai_run(client, config, prompt):
     activity = {"last": started}
     finished = threading.Event()
     threading.Thread(
-        target=heartbeat, args=(started, activity, finished, usage), daemon=True
+        target=heartbeat,
+        args=(started, activity, finished, lambda: usage),
+        daemon=True,
     ).start()
     status(started, f"run started · {config['model']} · effort {config['effort']}")
 
