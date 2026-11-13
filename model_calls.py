@@ -47,6 +47,8 @@ def status(started, message, usage=None):
     if usage:
         approx = "~" if usage.get("is_estimate") else ""
         message += f" · in {usage['input']:,} · out {approx}{usage['output']:,}"
+        if usage.get("incomplete"):
+            message += " (usage incomplete)"
     print(f"[{elapsed}] {message}", flush=True)
 
 
@@ -126,6 +128,7 @@ async def claude_run(client, config, prompt):
         # Blocks are recorded as they finish, so a run cut off mid-response keeps its transcript.
         blocks = []
         response = None
+        partial_response = None
         remaining = max(0, deadline - time.monotonic())
         # Only the deadline bounds the request; SDK retries would reuse a stale timeout budget.
         attempt_client = client.with_options(timeout=remaining, max_retries=0)
@@ -137,6 +140,8 @@ async def claude_run(client, config, prompt):
                     async for event in stream:
                         activity["last"] = time.monotonic()
                         track_in_flight(in_flight, event)
+                        if event.type in {"message_start", "message_delta"}:
+                            partial_response = stream.current_message_snapshot
                         if event.type == "content_block_stop":
                             blocks.append(block_record(event.content_block))
                             if event.content_block.type == "server_tool_use":
@@ -153,6 +158,11 @@ async def claude_run(client, config, prompt):
             in_flight.update(input=0, chars=0)
 
         if response is None:
+            # Observed counts are a lower bound without the final response usage.
+            usage["incomplete"] = True
+            if partial_response is not None:
+                served_model = partial_response.model
+                add_usage(usage, partial_response.usage)
             stop["reason"] = "cut off" if stop["budget_exhausted"] else "error"
             responses.append({"stop_reason": stop["reason"], "blocks": blocks})
             break
