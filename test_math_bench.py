@@ -11,7 +11,7 @@ import math_bench
 
 class OutputTests(unittest.TestCase):
     def test_output_root(self):
-        self.assertEqual(math_bench.OUTPUT_DIR, math_bench.HERE / "out")
+        self.assertEqual(math_bench.OUTPUT_DIR, math_bench.HERE / "out" / "math")
 
     def test_model_directories(self):
         started = datetime(2026, 11, 17, 12, 30, 45)

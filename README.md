@@ -20,7 +20,7 @@ uv run math_bench.py
 
 Set `MATH_MODEL` to `gpt-6.2-sol` or `gpt-6.2-astra` with `MATH_PROVIDER=openai`. Both use the existing Responses API runner.
 
-Results go to `out/<model>/<datetime>_<model>/` as `run.json` and `run.md`.
+Results go to `out/math/<model>/<datetime>_<model>/` as `run.json` and `run.md`.
 
 Tests: `uv run python -m unittest`
 

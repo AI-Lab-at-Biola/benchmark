@@ -2,7 +2,7 @@
 
 Run once a day:  uv run math_bench.py
 Config comes from .env; MATH_PROVIDER picks Anthropic or OpenAI.
-Writes out/<model>/<datetime>_<model>/run.json and run.md.
+Writes out/math/<model>/<datetime>_<model>/run.json and run.md.
 """
 
 import hashlib
@@ -26,7 +26,7 @@ from model_calls import (
 
 PROMPT_VERSION = "math-v2"
 HERE = Path(__file__).resolve().parent
-OUTPUT_DIR = HERE / "out"
+OUTPUT_DIR = HERE / "out" / "math"
 
 # Section 10: phrases that suggest the model recalled the paper.
 CONTAMINATION_PATTERNS = [
@@ -388,7 +388,7 @@ def write_markdown(path, config, prompt, run, result, started):
 
 
 def run_dir(started, model):
-    """out/<model>/<datetime>_<model>/, one folder per run."""
+    """out/math/<model>/<datetime>_<model>/, one folder per run."""
     model = re.sub(r"[^A-Za-z0-9._-]", "_", model).strip(".") or "model"
     path = OUTPUT_DIR / model / f"{started:%Y-%m-%d_%H%M%S}_{model}"
     path.mkdir(parents=True)
