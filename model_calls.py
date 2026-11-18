@@ -26,6 +26,11 @@ OPENAI_TERMINAL_EVENTS = {
     "response.incomplete",
     "response.failed",
 }
+OPENAI_OUTPUT_DELTAS = {
+    "response.output_text.delta",
+    "response.refusal.delta",
+    "response.code_interpreter_call_code.delta",
+}
 
 
 # --- Shared ----------------------------------------------------------------------------------
@@ -45,15 +50,21 @@ def budget_exhausted(config, started, tool_calls, output_tokens):
 def status(started, message, usage=None):
     elapsed = time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - started))
     if usage:
-        approx = "~" if usage.get("is_estimate") else ""
-        message += f" · in {usage['input']:,} · out {approx}{usage['output']:,}"
+        input_prefix = "~" if usage.get("input_is_estimate") else ""
+        output_prefix = "~" if usage.get("is_estimate") else ""
+        message += (
+            f" · in {input_prefix}{usage['input']:,}"
+            f" · out {output_prefix}{usage['output']:,}"
+        )
         if usage.get("incomplete"):
             message += " (usage incomplete)"
     print(f"[{elapsed}] {message}", flush=True)
 
 
-def heartbeat(started, activity, finished, current_usage, every_s=120):
-    """Every couple of quiet minutes, say how long it's been since the stream sent anything.
+def heartbeat(
+    started, activity, finished, current_usage, every_s=120, *, report_active=False
+):
+    """Report usage periodically during quiet stretches and optionally during active streams.
 
     Long code runs in the sandbox are silent, so a quiet stretch alone isn't a stall;
     a number that keeps climbing past ~15 min is.
@@ -66,6 +77,8 @@ def heartbeat(started, activity, finished, current_usage, every_s=120):
                 f"still waiting · {quiet_min:.0f} min since last update",
                 current_usage(),
             )
+        elif report_active:
+            status(started, "response in progress", current_usage())
 
 
 # --- Claude ----------------------------------------------------------------------------------
@@ -324,10 +337,12 @@ async def openai_run(client, config, prompt):
     served_model = None
     started = time.monotonic()
     activity = {"last": started}
+    displayed_usage = usage
     finished = threading.Event()
     threading.Thread(
         target=heartbeat,
-        args=(started, activity, finished, lambda: usage),
+        args=(started, activity, finished, lambda: displayed_usage),
+        kwargs={"report_active": True},
         daemon=True,
     ).start()
     status(started, f"run started · {config['model']} · effort {config['effort']}")
@@ -353,6 +368,17 @@ async def openai_run(client, config, prompt):
             if previous_id:
                 request["previous_response_id"] = previous_id
 
+            # Estimate from request text and streamed output; server context and private
+            # reasoning are reflected in the API's final usage.
+            output_chars = 0
+            displayed_usage = {
+                **usage,
+                "input": usage["input"] + (len(next_input) + 3) // 4,
+                "input_is_estimate": True,
+                "is_estimate": True,
+            }
+            status(started, f"response {len(responses) + 1} started", displayed_usage)
+
             # Items are recorded as they finish, so a run cut off mid-response keeps its transcript.
             blocks = []
             response = None
@@ -367,13 +393,19 @@ async def openai_run(client, config, prompt):
                         activity["last"] = time.monotonic()
                         if event.type == "response.created":
                             response_id = event.response.id
+                        if event.type in OPENAI_OUTPUT_DELTAS:
+                            output_chars += len(event.delta)
+                            displayed_usage = {
+                                **displayed_usage,
+                                "output": usage["output"] + (output_chars + 3) // 4,
+                            }
                         if event.type == "response.output_item.done":
                             blocks += openai_item_records(event.item)
                             if event.item.type == "code_interpreter_call":
                                 tool_calls += 1
                             note = openai_item_status(event.item)
                             if note:
-                                status(started, note, usage)
+                                status(started, note, displayed_usage)
                         if event.type in OPENAI_TERMINAL_EVENTS:
                             response = event.response
                         if time.monotonic() >= deadline:
@@ -390,6 +422,7 @@ async def openai_run(client, config, prompt):
                     await cancel_openai_response(client, response_id)
 
             if response is None:
+                usage["incomplete"] = True
                 if not stop["error"] and not stop["budget_exhausted"]:
                     stop["budget_exhausted"] = (
                         "wall_clock"  # openai_events ran out of time reconnecting
@@ -399,7 +432,12 @@ async def openai_run(client, config, prompt):
                 break
 
             served_model = response.model
-            add_openai_usage(usage, response.usage)
+            usage = dict(usage)
+            if response.usage is None:
+                usage["incomplete"] = True
+            else:
+                add_openai_usage(usage, response.usage)
+            displayed_usage = usage
             reason = response.status
             if response.incomplete_details and response.incomplete_details.reason:
                 reason = f"incomplete: {response.incomplete_details.reason}"

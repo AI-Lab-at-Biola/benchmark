@@ -62,6 +62,8 @@ class OpenAIDeadlineTests(unittest.IsolatedAsyncioTestCase):
                 mocked.monotonic.side_effect = lambda: self.now
             if target.endswith("sleep"):
                 self.sleep = mocked
+            if target.endswith("status"):
+                self.status = mocked
 
     def advance(self, seconds):
         self.now += seconds
@@ -161,6 +163,56 @@ class OpenAIDeadlineTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         self.assertTrue(all(stream.is_closed for stream in self.streams))
+
+    async def test_token_progress_survives_reconnect_and_reconciles_with_final_usage(self):
+        code_delta = {
+            "type": "response.code_interpreter_call_code.delta",
+            "sequence_number": 1,
+            "item_id": "ci_test",
+            "output_index": 0,
+            "delta": "print(1)",
+        }
+        code_done = {
+            "type": "response.output_item.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": {
+                "id": "ci_test",
+                "type": "code_interpreter_call",
+                "code": "print(1)",
+                "status": "completed",
+                "container_id": "cntr_test",
+                "outputs": [],
+            },
+        }
+        completed = response_event("response.completed", 3)
+        completed["response"]["usage"] = {
+            "input_tokens": 30,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 20,
+            "output_tokens_details": {"reasoning_tokens": 18},
+            "total_tokens": 50,
+        }
+        created = response_event("response.created", 0)
+        self.actions = [[created, code_delta], [created, code_delta, code_done, completed]]
+
+        result = await self.run_model(10)
+
+        progress = {
+            call.args[1]: call.args[2]
+            for call in self.status.call_args_list
+            if len(call.args) == 3
+        }
+        self.assertEqual(progress["response 1 started"]["input"], 1)
+        live_usage = progress["ran code (completed): print(1)"]
+        self.assertEqual(live_usage["output"], 2)
+        self.assertTrue(live_usage["input_is_estimate"])
+        self.assertTrue(live_usage["is_estimate"])
+        self.assertEqual(
+            result["usage"],
+            {"input": 30, "output": 20, "cache_read": 0, "cache_write": 0, "thinking": 18},
+        )
+        self.assertEqual(progress["run ended · completed"], result["usage"])
 
     async def test_deadline_during_reconnect_timeout_cancels_and_reports_wall_clock(
         self,
