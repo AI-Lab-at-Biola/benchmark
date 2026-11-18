@@ -312,6 +312,7 @@ def block_markdown(block):
 
 def write_markdown(path, config, prompt, run, result, started):
     usage = run["usage"]
+    usage_note = " (usage incomplete)" if usage.get("incomplete") else ""
     verified = (
         result["verified_phi"]
         if result["valid"]
@@ -332,7 +333,7 @@ def write_markdown(path, config, prompt, run, result, started):
             "Tokens",
             f"input {usage['input']:,} · output {usage['output']:,} "
             f"(thinking {usage['thinking']:,}) · cache read {usage['cache_read']:,} "
-            f"· cache write {usage['cache_write']:,}",
+            f"· cache write {usage['cache_write']:,}{usage_note}",
         ),
         (
             "Tool calls · wall-clock",
