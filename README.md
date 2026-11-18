@@ -18,9 +18,11 @@ Add your API keys in the `.env` file.
 uv run math_bench.py
 ```
 
-Results go to `out/math/<datetime>_<model>/` as `run.json` and `run.md`.
+Set `MATH_MODEL` to `gpt-6.2-sol` or `gpt-6.2-astra` with `MATH_PROVIDER=openai`. Both use the existing Responses API runner.
 
-Tests: `uv run python -m unittest test_model_calls.py`
+Results go to `out/math/<model>/<datetime>_<model>/` as `run.json` and `run.md`.
+
+Tests: `uv run python -m unittest`
 
 ## Roadmap
 
